@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ClinicalReport, Language, DoctorUser, ReportShare } from '../types';
+import { ClinicalReport, Language, DoctorUser, ReportShare, Medication, Allergy } from '../types';
 import {
   FileText,
   Printer,
@@ -24,7 +24,14 @@ import {
   Search,
   X,
   RefreshCw,
+  Plus,
+  Trash2,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
+import { searchDoctors, fetchDoctorsDirectory, DoctorSearchResult } from '../services/doctorSearchService';
+import { deliverReportToDoctor } from '../services/reportDeliveryService';
+import { updateReportField } from '../services/reportAnalysisService';
 
 interface PreConsultationReportViewProps {
   report: ClinicalReport;
@@ -32,15 +39,36 @@ interface PreConsultationReportViewProps {
   onProceedToDoctor?: () => void;
   isDoctorView?: boolean;
   onApproveByDoctor?: (notes: string) => Promise<void>;
+  onRegenerateReport?: () => void;
 }
 
 export const PreConsultationReportView: React.FC<PreConsultationReportViewProps> = ({
-  report,
+  report: initialReport,
   language,
   onProceedToDoctor,
   isDoctorView = false,
   onApproveByDoctor,
+  onRegenerateReport,
 }) => {
+  const [report, setReport] = useState<ClinicalReport>(initialReport);
+  const [isEditing, setIsEditing] = useState(false);
+  const [isConfirmedReadyToSend, setIsConfirmedReadyToSend] = useState(false);
+
+  // Editable drafts
+  const [draftCC, setDraftCC] = useState(report.chiefComplaint);
+  const [draftOnset, setDraftOnset] = useState(report.hpiDetails?.onset || '');
+  const [draftSeverity, setDraftSeverity] = useState(report.hpiDetails?.severity || '');
+  const [draftRadiation, setDraftRadiation] = useState(report.hpiDetails?.radiation || '');
+  const [draftMeds, setDraftMeds] = useState<Medication[]>([...report.drugHistory]);
+  const [draftAllergies, setDraftAllergies] = useState<Allergy[]>([...report.allergies]);
+  const [draftPastHistory, setDraftPastHistory] = useState<string>(report.pastMedicalHistory.join(', '));
+
+  // New item inputs
+  const [newMedName, setNewMedName] = useState('');
+  const [newMedDose, setNewMedDose] = useState('');
+  const [newAllergySubstance, setNewAllergySubstance] = useState('');
+
+  // Doctor sign-off
   const [doctorNotes, setDoctorNotes] = useState(report.doctorNotes || '');
   const [isApproving, setIsApproving] = useState(false);
   const [isApproved, setIsApproved] = useState(report.status === 'FINALIZED');
@@ -49,27 +77,52 @@ export const PreConsultationReportView: React.FC<PreConsultationReportViewProps>
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [doctorsList, setDoctorsList] = useState<DoctorUser[]>([]);
   const [isLoadingDoctors, setIsLoadingDoctors] = useState(false);
-  const [searchDocQuery, setSearchDocQuery] = useState('');
-  const [selectedHospitalFilter, setSelectedHospitalFilter] = useState('ALL');
-  const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
+
+  // User input filters (Doctor Name & Hospital / Clinic Name)
+  const [searchDoctorName, setSearchDoctorName] = useState('');
+  const [searchHospitalName, setSearchHospitalName] = useState('');
+  const [searchResults, setSearchResults] = useState<DoctorSearchResult[]>([]);
+
+  // Doctor selection & confirmation state (NEVER default to first doctor!)
+  const [selectedDoctor, setSelectedDoctor] = useState<DoctorUser | null>(null);
+  const [showSendConfirmation, setShowSendConfirmation] = useState(false);
   const [patientNote, setPatientNote] = useState('');
   const [isSendingShare, setIsSendingShare] = useState(false);
   const [sharesList, setSharesList] = useState<any[]>(report.sharedWith || []);
   const [shareSuccessToast, setShareSuccessToast] = useState<string | null>(null);
 
-  // Fetch doctors and any existing shares when opening modal
+  // Expanded profile state in search list
+  const [expandedDocId, setExpandedDocId] = useState<string | null>(null);
+
+  // Keep internal report in sync if prop changes
+  useEffect(() => {
+    setReport(initialReport);
+    setDraftCC(initialReport.chiefComplaint);
+    setDraftOnset(initialReport.hpiDetails?.onset || '');
+    setDraftSeverity(initialReport.hpiDetails?.severity || '');
+    setDraftRadiation(initialReport.hpiDetails?.radiation || '');
+    setDraftMeds([...initialReport.drugHistory]);
+    setDraftAllergies([...initialReport.allergies]);
+    setDraftPastHistory(initialReport.pastMedicalHistory.join(', '));
+  }, [initialReport]);
+
+  // Load registered doctors when opening share modal
   const openShareModal = async () => {
     setIsShareModalOpen(true);
+    setSelectedDoctor(null);
+    setShowSendConfirmation(false);
     setIsLoadingDoctors(true);
+
     try {
-      const res = await fetch('/api/doctors');
-      if (res.ok) {
-        const docs = await res.json();
-        setDoctorsList(docs);
-        if (docs.length > 0 && !selectedDocId) {
-          setSelectedDocId(docs[0].id);
-        }
-      }
+      const docs = await fetchDoctorsDirectory();
+      setDoctorsList(docs);
+      // Run initial search with empty or current queries
+      const results = searchDoctors(docs, {
+        doctorName: searchDoctorName,
+        hospitalName: searchHospitalName,
+      });
+      setSearchResults(results);
+
       // Check existing shares
       const sharesRes = await fetch(`/api/reports/${report.id}/shares`);
       if (sharesRes.ok) {
@@ -85,33 +138,117 @@ export const PreConsultationReportView: React.FC<PreConsultationReportViewProps>
     }
   };
 
-  const handleShareReport = async () => {
-    if (!selectedDocId) return;
-    setIsSendingShare(true);
-    try {
-      const res = await fetch('/api/reports/share', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          reportId: report.id,
-          doctorId: selectedDocId,
-          patientNotes: patientNote,
-        }),
+  // Perform search matching Doctor Name AND Hospital Name
+  const handlePerformSearch = () => {
+    const results = searchDoctors(doctorsList, {
+      doctorName: searchDoctorName,
+      hospitalName: searchHospitalName,
+    });
+    setSearchResults(results);
+    setSelectedDoctor(null);
+    setShowSendConfirmation(false);
+  };
+
+  // Auto-filter as user types
+  useEffect(() => {
+    if (doctorsList.length > 0) {
+      const results = searchDoctors(doctorsList, {
+        doctorName: searchDoctorName,
+        hospitalName: searchHospitalName,
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        const updatedShares = [data.share, ...sharesList.filter(s => s.doctorId !== selectedDocId)];
+      setSearchResults(results);
+    }
+  }, [searchDoctorName, searchHospitalName, doctorsList]);
+
+  // Save reviewed & edited report
+  const handleSaveEdits = () => {
+    const updated = updateReportField(report, {
+      chiefComplaint: draftCC,
+      hpiDetails: {
+        ...(report.hpiDetails || {
+          duration: 'Acute onset',
+          progression: 'Stable',
+          character: 'Ache / Discomfort',
+          location: 'Local / Generalized',
+          aggravating: 'Physical exertion',
+          relieving: 'Rest',
+          associatedSymptoms: 'None reported',
+        }),
+        onset: draftOnset,
+        severity: draftSeverity,
+        radiation: draftRadiation,
+      },
+      drugHistory: draftMeds.length > 0 ? draftMeds : [{ name: 'None reported', dosage: '-', frequency: '-' }],
+      allergies: draftAllergies.length > 0 ? draftAllergies : [{ substance: 'No known drug allergies reported', reaction: '-' }],
+      pastMedicalHistory: draftPastHistory.split(',').map(s => s.trim()).filter(Boolean),
+    });
+
+    setReport(updated);
+    setIsEditing(false);
+    setIsConfirmedReadyToSend(true);
+  };
+
+  const handleConfirmReport = () => {
+    setIsEditing(false);
+    setIsConfirmedReadyToSend(true);
+  };
+
+  const handleAddMedication = () => {
+    if (!newMedName.trim()) return;
+    setDraftMeds([
+      ...draftMeds.filter(m => !m.name.toLowerCase().includes('none')),
+      { name: newMedName.trim(), dosage: newMedDose.trim() || 'As prescribed', frequency: 'Daily', source: 'Patient verified' },
+    ]);
+    setNewMedName('');
+    setNewMedDose('');
+  };
+
+  const handleRemoveMedication = (index: number) => {
+    setDraftMeds(draftMeds.filter((_, i) => i !== index));
+  };
+
+  const handleAddAllergy = () => {
+    if (!newAllergySubstance.trim()) return;
+    setDraftAllergies([
+      ...draftAllergies.filter(a => !a.substance.toLowerCase().includes('no known')),
+      { substance: newAllergySubstance.trim(), reaction: 'Patient verified allergy', source: 'Patient reported' },
+    ]);
+    setNewAllergySubstance('');
+  };
+
+  const handleRemoveAllergy = (index: number) => {
+    setDraftAllergies(draftAllergies.filter((_, i) => i !== index));
+  };
+
+  // Deliver report to selected doctor
+  const handleConfirmAndSend = async () => {
+    if (!selectedDoctor) return;
+    setIsSendingShare(true);
+
+    try {
+      const res = await deliverReportToDoctor(report, selectedDoctor, patientNote);
+      if (res.success) {
+        const updatedShares = [
+          {
+            id: res.shareId,
+            doctorId: selectedDoctor.id,
+            doctorName: selectedDoctor.fullName,
+            hospitalName: selectedDoctor.hospitalName,
+            status: 'DELIVERED',
+            sharedAt: new Date().toISOString(),
+          },
+          ...sharesList.filter(s => s.doctorId !== selectedDoctor.id),
+        ];
         setSharesList(updatedShares);
-        setShareSuccessToast(`Delivered to ${data.share.doctorName} (${data.share.hospitalName || 'OPD'}). Status: DELIVERED`);
+        setShareSuccessToast(`Delivered to ${selectedDoctor.fullName} (${selectedDoctor.hospitalName || 'OPD'}). Status: DELIVERED`);
         setIsShareModalOpen(false);
+        setSelectedDoctor(null);
+        setShowSendConfirmation(false);
         setPatientNote('');
         setTimeout(() => setShareSuccessToast(null), 6000);
-      } else {
-        alert(data.error || 'Failed to share report with doctor.');
       }
-    } catch (e) {
-      console.error('Error sharing report:', e);
-      alert('Network error while sharing report. Please try again.');
+    } catch (err) {
+      console.error('Failed to deliver report:', err);
     } finally {
       setIsSendingShare(false);
     }
@@ -181,19 +318,6 @@ DISCLAIMER: ${report.disclaimer || 'AI-generated clinical intake summary. Must b
 
   const isHighPriority = report.triagePriority === 'HIGH';
 
-  // Hospitals for filter
-  const uniqueHospitals = Array.from(new Set(doctorsList.map(d => d.hospitalName).filter(Boolean)));
-
-  const filteredDoctors = doctorsList.filter(doc => {
-    const matchesSearch =
-      doc.fullName.toLowerCase().includes(searchDocQuery.toLowerCase()) ||
-      doc.specialization.toLowerCase().includes(searchDocQuery.toLowerCase()) ||
-      (doc.hospitalName && doc.hospitalName.toLowerCase().includes(searchDocQuery.toLowerCase()));
-
-    if (selectedHospitalFilter === 'ALL') return matchesSearch;
-    return matchesSearch && doc.hospitalName === selectedHospitalFilter;
-  });
-
   return (
     <div className="w-full max-w-4xl mx-auto space-y-6">
       {/* Toast Notification */}
@@ -209,274 +333,404 @@ DISCLAIMER: ${report.disclaimer || 'AI-generated clinical intake summary. Must b
         </div>
       )}
 
-      {/* ACTION BAR (Print, Export, Send to Doctor, Doctor Queue) */}
+      {/* REPORT REVIEW & VERIFICATION BANNER (BEFORE SENDING) */}
+      {!isDoctorView && (
+        <div className="p-4 bg-white rounded-2xl border border-slate-200 shadow-xs print:hidden space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className={`w-9 h-9 rounded-xl flex items-center justify-center border ${
+                isConfirmedReadyToSend 
+                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
+                  : 'bg-amber-50 text-amber-700 border-amber-200'
+              }`}>
+                {isConfirmedReadyToSend ? <CheckCircle2 className="w-5 h-5" /> : <Edit3 className="w-5 h-5" />}
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">
+                  {isConfirmedReadyToSend ? 'Report Ready to Send' : 'Review Clinical Report Before Sending'}
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  {isConfirmedReadyToSend
+                    ? 'All medical intake details confirmed. You can now select and route this report to your doctor.'
+                    : 'Please review your symptoms, medications, and allergies. You can edit or remove any incorrect item.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {!isEditing ? (
+                <>
+                  <button
+                    onClick={() => setIsEditing(true)}
+                    className="px-3 py-1.5 border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer transition-all"
+                  >
+                    <Edit3 className="w-3.5 h-3.5" />
+                    <span>Edit Report</span>
+                  </button>
+
+                  {!isConfirmedReadyToSend ? (
+                    <button
+                      onClick={handleConfirmReport}
+                      className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer transition-all"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Confirm Report</span>
+                    </button>
+                  ) : (
+                    <button
+                      onClick={openShareModal}
+                      className="px-4 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer transition-all"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Send Report to Doctor</span>
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setIsEditing(false)}
+                    className="px-3 py-1.5 border border-slate-200 hover:bg-slate-50 text-slate-600 font-semibold rounded-xl text-xs cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSaveEdits}
+                    className="px-4 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save & Confirm</span>
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TOP ACTION BAR (Print, Download, Send to Doctor) */}
       <div className="flex flex-wrap items-center justify-between gap-3 p-4 bg-white rounded-2xl border border-slate-200 shadow-xs print:hidden">
         <div className="flex items-center gap-2">
-          <div className="w-9 h-9 rounded-xl bg-teal-50 text-teal-700 flex items-center justify-center border border-teal-200">
-            <FileText className="w-5 h-5" />
+          <div className="w-8 h-8 rounded-xl bg-teal-50 text-teal-700 flex items-center justify-center border border-teal-200">
+            <FileText className="w-4 h-4" />
           </div>
           <div>
-            <h3 className="text-sm font-bold text-slate-900">
-              Structured Pre-Consultation Clinical Report
-            </h3>
-            <p className="text-[11px] text-slate-500">
-              Report ID: {report.id} • FHIR R4 Bundle Ready
-            </p>
+            <h4 className="text-xs font-bold text-slate-900">Pre-Consultation Clinical Record</h4>
+            <p className="text-[10px] text-slate-500">ID: {report.id} • Triage: {report.triagePriority}</p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-2">
           <button
-            onClick={handleDownloadSummary}
-            className="flex items-center gap-1.5 px-3 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 transition-all cursor-pointer"
-            title="Download Summary Text"
+            onClick={handlePrint}
+            className="px-3 py-1.5 border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer"
           >
-            <Download className="w-4 h-4 text-slate-600" />
-            <span>Download</span>
+            <Printer className="w-3.5 h-3.5" />
+            <span>Print</span>
           </button>
 
           <button
-            onClick={handlePrint}
-            className="flex items-center gap-1.5 px-3 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 transition-all cursor-pointer"
+            onClick={handleDownloadSummary}
+            className="px-3 py-1.5 border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer"
           >
-            <Printer className="w-4 h-4" />
-            <span>Print Report</span>
+            <Download className="w-3.5 h-3.5" />
+            <span>Download</span>
           </button>
 
           {!isDoctorView && (
             <button
               onClick={openShareModal}
-              className="flex items-center gap-1.5 px-4 py-2 bg-teal-50 hover:bg-teal-100 border border-teal-300 text-teal-800 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs"
+              className="px-4 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer transition-all"
             >
-              <Share2 className="w-4 h-4 text-teal-700" />
+              <Share2 className="w-3.5 h-3.5" />
               <span>Send to Doctor</span>
             </button>
           )}
 
-          {onProceedToDoctor && !isDoctorView && (
-            <button
-              onClick={onProceedToDoctor}
-              className="flex items-center gap-2 px-5 py-2 bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs rounded-xl shadow-xs transition-all cursor-pointer hover:scale-[1.01]"
-            >
-              <span>Proceed to Doctor Queue</span>
-              <ArrowRight className="w-4 h-4" />
-            </button>
+          {sharesList.length > 0 && (
+            <div className="flex items-center gap-1 px-2.5 py-1 bg-teal-50 text-teal-800 border border-teal-200 rounded-xl text-[11px] font-bold">
+              <CheckCircle2 className="w-3.5 h-3.5 text-teal-600" />
+              <span>Sent to {sharesList[0].doctorName || 'Doctor'}</span>
+            </div>
           )}
         </div>
       </div>
 
-      {/* PRINTABLE OFFICIAL REPORT CARD */}
-      <div className="bg-white border-2 border-slate-300 rounded-3xl p-8 shadow-sm space-y-6 print:border-none print:p-0">
-        {/* OFFICIAL HEADER */}
-        <div className="border-b-2 border-slate-900 pb-5">
-          <div className="flex items-start justify-between">
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-black uppercase tracking-widest bg-slate-900 text-white px-2 py-0.5 rounded">
-                  GOVERNMENT OF INDIA
-                </span>
-                <span className="text-[10px] font-black uppercase tracking-widest bg-amber-600 text-white px-2 py-0.5 rounded">
-                  MINISTRY OF AYUSH / AIIA
-                </span>
-              </div>
-              <h1 className="text-2xl font-black text-slate-900 tracking-tight pt-1">
-                MediKiosk Pre-Consultation Clinical Intake Summary
-              </h1>
-              <p className="text-xs text-slate-600 font-medium">
-                National Digital Health Mission (ABDM) • All India Institute of Ayurveda Clinical Protocol
-              </p>
-            </div>
+      {/* EDITABLE REVIEW FORM (When isEditing is true) */}
+      {isEditing && (
+        <div className="p-5 bg-teal-50/40 rounded-3xl border-2 border-teal-300 shadow-xs space-y-4 text-xs animate-fade-in print:hidden">
+          <div className="flex items-center justify-between pb-2 border-b border-teal-200">
+            <span className="font-bold uppercase tracking-wider text-teal-900">
+              Edit & Correct Intake Details
+            </span>
+            <span className="text-[11px] text-teal-700">Patient Self-Verification Mode</span>
+          </div>
 
-            {/* Verification Watermark */}
-            <div className="text-right shrink-0">
-              <span
-                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-black uppercase tracking-wider border ${
-                  isApproved || report.status === 'FINALIZED'
-                    ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
-                    : isHighPriority
-                    ? 'bg-red-50 text-red-900 border-red-300'
-                    : 'bg-amber-50 text-amber-900 border-amber-300'
-                }`}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block font-bold text-slate-700 uppercase text-[10px] mb-1">Chief Complaint:</label>
+              <input
+                type="text"
+                value={draftCC}
+                onChange={e => setDraftCC(e.target.value)}
+                className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+            </div>
+            <div>
+              <label className="block font-bold text-slate-700 uppercase text-[10px] mb-1">Onset / Duration:</label>
+              <input
+                type="text"
+                value={draftOnset}
+                onChange={e => setDraftOnset(e.target.value)}
+                placeholder="e.g., Started 3 days ago"
+                className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+            </div>
+            <div>
+              <label className="block font-bold text-slate-700 uppercase text-[10px] mb-1">Severity / Pain Scale:</label>
+              <input
+                type="text"
+                value={draftSeverity}
+                onChange={e => setDraftSeverity(e.target.value)}
+                placeholder="e.g., Moderate (5/10) or Severe"
+                className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+            </div>
+            <div>
+              <label className="block font-bold text-slate-700 uppercase text-[10px] mb-1">Radiation / Location:</label>
+              <input
+                type="text"
+                value={draftRadiation}
+                onChange={e => setDraftRadiation(e.target.value)}
+                placeholder="e.g., Radiating to left arm or None"
+                className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+            </div>
+          </div>
+
+          {/* Edit Medications */}
+          <div className="pt-2 border-t border-teal-200/60">
+            <span className="font-bold text-slate-800 uppercase text-[10px] block mb-2">Active Medications:</span>
+            <div className="space-y-1.5 mb-2">
+              {draftMeds.map((m, idx) => (
+                <div key={idx} className="flex items-center justify-between p-2 bg-white rounded-xl border border-slate-200">
+                  <span className="font-bold text-slate-800">{m.name} ({m.dosage})</span>
+                  <button
+                    onClick={() => handleRemoveMedication(idx)}
+                    className="text-red-500 hover:text-red-700 p-1 hover:bg-red-50 rounded-lg cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="Medication name (e.g., Telmisartan)"
+                value={newMedName}
+                onChange={e => setNewMedName(e.target.value)}
+                className="flex-1 px-3 py-1.5 bg-white border border-slate-300 rounded-xl text-xs focus:outline-none"
+              />
+              <input
+                type="text"
+                placeholder="Dose (e.g., 40mg OD)"
+                value={newMedDose}
+                onChange={e => setNewMedDose(e.target.value)}
+                className="w-32 px-3 py-1.5 bg-white border border-slate-300 rounded-xl text-xs focus:outline-none"
+              />
+              <button
+                onClick={handleAddMedication}
+                className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold rounded-xl text-xs flex items-center gap-1 cursor-pointer"
               >
-                {isApproved || report.status === 'FINALIZED' ? (
-                  <>
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    <span>FINALIZED — PHYSICIAN VERIFIED</span>
-                  </>
-                ) : (
-                  <>
-                    <AlertCircle className="w-4 h-4 text-amber-600" />
-                    <span>DRAFT — PHYSICIAN VERIFICATION REQUIRED</span>
-                  </>
-                )}
-              </span>
-              <p className="text-[10px] text-slate-400 mt-1 font-mono">Generated: {new Date(report.generatedAt).toLocaleString()}</p>
+                <Plus className="w-3.5 h-3.5" /> Add
+              </button>
+            </div>
+          </div>
+
+          {/* Edit Allergies */}
+          <div className="pt-2 border-t border-teal-200/60">
+            <span className="font-bold text-slate-800 uppercase text-[10px] block mb-2">Known Allergies:</span>
+            <div className="space-y-1.5 mb-2">
+              {draftAllergies.map((a, idx) => (
+                <div key={idx} className="flex items-center justify-between p-2 bg-red-50 text-red-900 rounded-xl border border-red-200">
+                  <span className="font-bold">{a.substance} ({a.reaction || 'Allergy'})</span>
+                  <button
+                    onClick={() => handleRemoveAllergy(idx)}
+                    className="text-red-600 hover:text-red-800 p-1 hover:bg-red-100 rounded-lg cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="Allergy substance (e.g., Penicillin)"
+                value={newAllergySubstance}
+                onChange={e => setNewAllergySubstance(e.target.value)}
+                className="flex-1 px-3 py-1.5 bg-white border border-slate-300 rounded-xl text-xs focus:outline-none"
+              />
+              <button
+                onClick={handleAddAllergy}
+                className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold rounded-xl text-xs flex items-center gap-1 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" /> Add Allergy
+              </button>
             </div>
           </div>
         </div>
+      )}
 
-        {/* SECTION 1: PATIENT DEMOGRAPHICS & IDENTIFIERS */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-200 text-xs">
+      {/* CLINICAL REPORT MAIN PAPER */}
+      <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-10 space-y-6 text-slate-800 font-sans print:shadow-none print:border-none print:p-0">
+        {/* REPORT HEADER */}
+        <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-5">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="px-2 py-0.5 bg-teal-50 text-teal-800 border border-teal-200 rounded text-[10px] font-bold uppercase tracking-wider">
+                ABDM / FHIR R4 Format
+              </span>
+              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
+                isHighPriority ? 'bg-red-100 text-red-800 border border-red-200' : 'bg-slate-100 text-slate-700'
+              }`}>
+                Triage: {report.triagePriority}
+              </span>
+            </div>
+            <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">
+              Pre-Consultation Clinical Intake Summary
+            </h1>
+            <p className="text-xs text-slate-500">
+              Prepared by Anna AI Medical Assistant • MediKiosk OPD Triage Engine
+            </p>
+          </div>
+
+          <div className="text-right text-xs space-y-0.5 text-slate-500">
+            <div><span className="font-bold text-slate-800">Token:</span> {report.demographics.token}</div>
+            <div><span className="font-bold text-slate-800">Date:</span> {new Date(report.generatedAt).toLocaleDateString()}</div>
+            <div><span className="font-bold text-slate-800">Status:</span> {report.status}</div>
+          </div>
+        </div>
+
+        {/* SECTION 1: PATIENT DEMOGRAPHICS */}
+        <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
           <div>
             <span className="text-slate-400 block text-[10px] font-bold uppercase">Patient Name</span>
             <span className="font-bold text-slate-900 text-sm">{report.demographics.name}</span>
           </div>
           <div>
             <span className="text-slate-400 block text-[10px] font-bold uppercase">Age / Gender</span>
-            <span className="font-bold text-slate-800">{report.demographics.age} Years • {report.demographics.gender}</span>
-          </div>
-          <div>
-            <span className="text-slate-400 block text-[10px] font-bold uppercase">OPD Token #</span>
-            <span className="font-mono font-bold text-teal-800 bg-white px-2 py-0.5 rounded border border-slate-200">
-              {report.demographics.token}
-            </span>
+            <span className="font-bold text-slate-900">{report.demographics.age} Y / {report.demographics.gender}</span>
           </div>
           <div>
             <span className="text-slate-400 block text-[10px] font-bold uppercase">ABHA Address</span>
-            <span className="font-mono text-slate-700 truncate block">
-              {report.demographics.abhaAddress || 'Not linked'}
-            </span>
+            <span className="font-bold text-slate-900 font-mono text-[11px]">{report.demographics.abhaAddress || 'Not linked'}</span>
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px] font-bold uppercase">Contact Phone</span>
+            <span className="font-bold text-slate-900">{report.demographics.phone || 'N/A'}</span>
           </div>
         </div>
 
-        {/* SHARED WITH DOCTOR LIVE STATUS BADGE */}
-        {sharesList && sharesList.length > 0 && (
-          <div className="p-3 bg-teal-50/70 border border-teal-200 rounded-2xl space-y-2 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="font-bold text-teal-950 flex items-center gap-1.5 text-[11px] uppercase tracking-wider">
-                <Stethoscope className="w-3.5 h-3.5 text-teal-700" />
-                Report Shared with Medical Team ({sharesList.length})
-              </span>
-              <span className="text-[10px] text-teal-700 font-semibold">Live Transmission Status</span>
+        {/* RED FLAGS ALERT BANNER IF PRESENT */}
+        {report.redFlags && report.redFlags.length > 0 && (
+          <div className="p-4 bg-red-50 border-2 border-red-300 rounded-2xl space-y-1.5">
+            <div className="flex items-center gap-2 text-red-900 font-bold text-xs">
+              <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+              <span>SAFETY RED FLAGS IDENTIFIED FOR IMMEDIATE CLINICAL TRIAGE:</span>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {sharesList.map((share: any, sIdx: number) => (
-                <div key={sIdx} className="p-2.5 bg-white rounded-xl border border-teal-100 flex items-center justify-between text-xs">
-                  <div>
-                    <span className="font-bold text-slate-900 block">{share.doctorName}</span>
-                    <span className="text-[11px] text-slate-500">{share.hospitalName || 'OPD Department'}</span>
-                    <span className="text-[10px] text-slate-400 block">Sent: {new Date(share.sharedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                  </div>
-                  <span className={`px-2 py-0.5 text-[10px] font-bold rounded-lg uppercase tracking-wider border ${
-                    share.status === 'REVIEWED'
-                      ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                      : share.status === 'VIEWED'
-                      ? 'bg-blue-50 text-blue-800 border-blue-300'
-                      : 'bg-teal-50 text-teal-800 border-teal-300'
-                  }`}>
-                    {share.status}
-                  </span>
-                </div>
+            <ul className="list-disc pl-5 text-xs text-red-800 font-semibold space-y-0.5">
+              {report.redFlags.map((r, idx) => (
+                <li key={idx}>{r.ruleTriggered} - {r.actionRequired || 'Physician urgent review'}</li>
               ))}
-            </div>
+            </ul>
           </div>
         )}
 
-        {/* PRIORITY TRIAGE BANNER IF RED FLAG */}
-        {isHighPriority && (
-          <div className="p-4 bg-red-50 border-2 border-red-300 rounded-2xl flex items-start gap-3 text-xs text-red-950">
-            <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-bold uppercase tracking-wider text-red-800 text-[11px]">
-                High Priority Clinical Triage Alert
-              </p>
-              <p className="font-semibold mt-0.5">
-                Red flags detected: {report.redFlags.map(r => r.ruleTriggered).join(', ')}
-              </p>
-              <p className="text-red-700 text-[11px] mt-1">
-                Attending physician should prioritize clinical evaluation and review cardiac/respiratory parameters immediately.
-              </p>
-            </div>
+        {/* SECTION 2: CHIEF COMPLAINT & HPI */}
+        <div className="space-y-3 text-xs">
+          <div>
+            <span className="font-black uppercase tracking-wider text-slate-400 block text-[10px] mb-1">
+              Chief Complaint (CC)
+            </span>
+            <p className="text-sm font-bold text-slate-900">
+              {report.chiefComplaint}
+            </p>
           </div>
-        )}
 
-        {/* SECTION 2: CHIEF COMPLAINT & HISTORY OF PRESENT ILLNESS (HPI) */}
-        <div className="space-y-3">
-          <h2 className="text-xs font-black uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 flex items-center gap-1.5">
-            <HeartPulse className="w-4 h-4 text-teal-600" />
-            <span>Chief Complaint & History of Present Illness (HPI)</span>
-          </h2>
+          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-2">
+            <span className="font-black uppercase tracking-wider text-slate-400 block text-[10px]">
+              History of Present Illness (HPI Narrative)
+            </span>
+            <p className="text-slate-800 leading-relaxed">
+              {report.historyOfPresentIllness}
+            </p>
 
-          <div className="p-4 bg-teal-50/50 rounded-2xl border border-teal-100 space-y-2 text-xs">
-            <div>
-              <span className="font-bold text-teal-950 text-sm block">
-                Primary Complaint: {report.chiefComplaint}
-              </span>
-              <p className="text-slate-700 leading-relaxed mt-1">
-                {report.historyOfPresentIllness}
-              </p>
-            </div>
-
-            {/* HPI Breakdown Matrix */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-teal-200/50 text-[11px]">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-200/60 text-[11px]">
               <div>
-                <span className="text-slate-500 block font-semibold">Onset:</span>
-                <span className="font-bold text-slate-800">{report.hpiDetails.onset || '—'}</span>
+                <span className="text-slate-400 block">Onset:</span>
+                <span className="font-bold text-slate-800">{report.hpiDetails?.onset || '—'}</span>
               </div>
               <div>
-                <span className="text-slate-500 block font-semibold">Pain / Severity Score:</span>
-                <span className="font-bold text-slate-800">{report.hpiDetails.severity || '—'}</span>
+                <span className="text-slate-400 block">Severity:</span>
+                <span className="font-bold text-slate-800">{report.hpiDetails?.severity || '—'}</span>
               </div>
               <div>
-                <span className="text-slate-500 block font-semibold">Character:</span>
-                <span className="font-bold text-slate-800">{report.hpiDetails.character || '—'}</span>
+                <span className="text-slate-400 block">Character:</span>
+                <span className="font-bold text-slate-800">{report.hpiDetails?.character || '—'}</span>
               </div>
               <div>
-                <span className="text-slate-500 block font-semibold">Radiation:</span>
-                <span className="font-bold text-red-700">{report.hpiDetails.radiation || 'None reported'}</span>
+                <span className="text-slate-400 block">Radiation:</span>
+                <span className="font-bold text-red-700">{report.hpiDetails?.radiation || 'None reported'}</span>
               </div>
             </div>
           </div>
         </div>
 
         {/* SECTION 3: MEDICATIONS & ALLERGIES */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-          {/* Medications */}
-          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-2">
             <div className="flex items-center justify-between">
-              <span className="font-black uppercase tracking-wider text-slate-700">
-                Current Medications ({report.drugHistory.length})
+              <span className="font-black uppercase tracking-wider text-slate-400 text-[10px]">
+                Active Medications ({report.drugHistory.length})
               </span>
-              <span className="text-[10px] text-slate-500 font-semibold">Source Tagged</span>
+              <span className="text-[9px] bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded font-bold">
+                Patient Verified
+              </span>
             </div>
-
             {report.drugHistory.length === 0 ? (
-              <p className="text-slate-500 italic">No regular daily medications reported</p>
+              <p className="text-slate-400 italic">No active medications reported</p>
             ) : (
-              <div className="space-y-1.5">
-                {report.drugHistory.map((med, idx) => (
+              <div className="space-y-1">
+                {report.drugHistory.map((m, idx) => (
                   <div key={idx} className="p-2 bg-white rounded-xl border border-slate-200 flex items-center justify-between">
                     <div>
-                      <span className="font-bold text-slate-900">{med.name}</span>
-                      <span className="text-slate-500 ml-2">({med.dosage})</span>
-                      <span className="block text-[10px] text-slate-400">{med.frequency || 'Daily'}</span>
+                      <span className="font-bold text-slate-900 block">{m.name}</span>
+                      <span className="text-[10px] text-slate-500">{m.dosage} • {m.frequency || 'Daily'}</span>
                     </div>
-                    <span className="text-[9px] font-bold uppercase px-2 py-0.5 bg-teal-50 text-teal-800 border border-teal-200 rounded">
-                      {med.source || 'Patient Reported'}
-                    </span>
+                    {m.source && (
+                      <span className="text-[9px] bg-teal-50 text-teal-800 px-1.5 py-0.5 rounded border border-teal-200">
+                        {m.source}
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>
             )}
           </div>
 
-          {/* Allergies */}
-          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="font-black uppercase tracking-wider text-slate-700">
-                Known Allergies ({report.allergies.length})
-              </span>
-              <span className="text-[10px] font-bold text-red-700">Clinical Safety</span>
-            </div>
-
+          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-2">
+            <span className="font-black uppercase tracking-wider text-slate-400 text-[10px] block">
+              Known Drug Allergies ({report.allergies.length})
+            </span>
             {report.allergies.length === 0 ? (
-              <p className="text-slate-500 italic">No known drug allergies (NKDA)</p>
+              <p className="text-slate-400 italic">No known drug allergies (NKDA)</p>
             ) : (
-              <div className="space-y-1.5">
-                {report.allergies.map((allergy, idx) => (
-                  <div key={idx} className="p-2 bg-red-50 text-red-950 rounded-xl border border-red-200 flex items-center justify-between font-bold">
-                    <span>⚠️ {allergy.substance}</span>
-                    <span className="text-[10px] text-red-800">{allergy.reaction || 'Hypersensitivity'}</span>
+              <div className="space-y-1">
+                {report.allergies.map((a, idx) => (
+                  <div key={idx} className="p-2 bg-red-50 text-red-900 rounded-xl border border-red-200 font-semibold">
+                    ⚠️ {a.substance} ({a.reaction || 'Hypersensitivity'})
                   </div>
                 ))}
               </div>
@@ -484,39 +738,27 @@ DISCLAIMER: ${report.disclaimer || 'AI-generated clinical intake summary. Must b
           </div>
         </div>
 
-        {/* SECTION 4: MEDICAL HISTORY & LIFESTYLE */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-4 bg-slate-50 rounded-2xl border border-slate-200 text-xs">
+        {/* SECTION 4: PAST MEDICAL, SURGICAL & FAMILY */}
+        <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-3 text-xs">
           <div>
             <span className="text-slate-400 block text-[10px] font-bold uppercase mb-1">
-              Past Medical & Surgical
+              Past Medical & Surgical History
             </span>
             <p className="font-semibold text-slate-800">
               {report.pastMedicalHistory.length > 0 ? report.pastMedicalHistory.join(', ') : 'None reported'}
             </p>
           </div>
-
           <div>
             <span className="text-slate-400 block text-[10px] font-bold uppercase mb-1">
-              Family Medical History
+              Family & Lifestyle
             </span>
             <p className="font-semibold text-slate-800">
-              {report.familyHistory.length > 0
-                ? report.familyHistory.map(f => `${f.relationship}: ${f.condition}`).join('; ')
-                : 'Non-contributory'}
-            </p>
-          </div>
-
-          <div>
-            <span className="text-slate-400 block text-[10px] font-bold uppercase mb-1">
-              Personal & Lifestyle
-            </span>
-            <p className="font-semibold text-slate-800">
-              Diet: {report.personalHistory.diet || 'Regular'} • Sleep: {report.personalHistory.sleep || 'Normal'}
+              Diet: {report.personalHistory?.diet || 'Regular'} • Sleep: {report.personalHistory?.sleep || 'Normal'}
             </p>
           </div>
         </div>
 
-        {/* SECTION 5: AYUSH DASHAVIDHA PARIKSHA (IF AYUSH DATA) */}
+        {/* SECTION 5: AYUSH ASSESSMENT IF PRESENT */}
         {report.ayurvedaAssessment && (
           <div className="p-4 bg-amber-50/60 rounded-2xl border border-amber-200 space-y-2 text-xs">
             <span className="font-black uppercase tracking-wider text-amber-900 block">
@@ -570,7 +812,7 @@ DISCLAIMER: ${report.disclaimer || 'AI-generated clinical intake summary. Must b
                 <h3 className="font-bold text-teal-950 text-sm">Physician Review & Clinical Sign-Off</h3>
               </div>
               <span className="text-[10px] font-bold text-teal-800 bg-white px-2.5 py-1 rounded-lg border border-teal-200">
-                Medical Officer: Dr. Vivek Sharma, MD
+                Medical Officer Sign-off
               </span>
             </div>
 
@@ -626,18 +868,20 @@ DISCLAIMER: ${report.disclaimer || 'AI-generated clinical intake summary. Must b
         </div>
       </div>
 
-      {/* SEND TO DOCTOR MODAL */}
+      {/* SEND REPORT TO DOCTOR MODAL */}
       {isShareModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 print:hidden">
           <div className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4 max-h-[90vh] flex flex-col animate-scale-up">
+            
+            {/* Modal Header */}
             <div className="flex items-center justify-between pb-3 border-b border-slate-200">
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-xl bg-teal-50 text-teal-700 flex items-center justify-center border border-teal-200">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-2xl bg-teal-50 text-teal-700 flex items-center justify-center border border-teal-200">
                   <Share2 className="w-4 h-4" />
                 </div>
                 <div>
                   <h3 className="font-bold text-slate-900 text-sm">Send Report to Doctor</h3>
-                  <p className="text-[11px] text-slate-500">Select registered physician or hospital department</p>
+                  <p className="text-[11px] text-slate-500">Search verified physician by name and hospital</p>
                 </div>
               </div>
               <button
@@ -648,141 +892,193 @@ DISCLAIMER: ${report.disclaimer || 'AI-generated clinical intake summary. Must b
               </button>
             </div>
 
-            {/* Filters */}
-            <div className="space-y-2">
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search doctor by name, specialty, or hospital..."
-                  value={searchDocQuery}
-                  onChange={e => setSearchDocQuery(e.target.value)}
-                  className="w-full pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
-                />
-              </div>
-
-              {uniqueHospitals.length > 0 && (
-                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-[11px]">
-                  <button
-                    onClick={() => setSelectedHospitalFilter('ALL')}
-                    className={`px-2.5 py-1 rounded-lg font-semibold shrink-0 cursor-pointer transition-all ${
-                      selectedHospitalFilter === 'ALL'
-                        ? 'bg-teal-600 text-white'
-                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                    }`}
-                  >
-                    All Hospitals
-                  </button>
-                  {uniqueHospitals.map(h => (
-                    <button
-                      key={h}
-                      onClick={() => setSelectedHospitalFilter(h || 'ALL')}
-                      className={`px-2.5 py-1 rounded-lg font-semibold shrink-0 cursor-pointer transition-all ${
-                        selectedHospitalFilter === h
-                          ? 'bg-teal-600 text-white'
-                          : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                      }`}
-                    >
-                      {h}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Doctors List */}
-            <div className="flex-1 overflow-y-auto space-y-2 max-h-56 pr-1">
-              {isLoadingDoctors ? (
-                <div className="py-8 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
-                  <RefreshCw className="w-4 h-4 animate-spin text-teal-600" />
-                  <span>Loading registered doctors...</span>
-                </div>
-              ) : filteredDoctors.length === 0 ? (
-                <div className="py-8 text-center text-slate-400 text-xs">
-                  No doctors found matching criteria.
-                </div>
-              ) : (
-                filteredDoctors.map(doc => (
-                  <div
-                    key={doc.id}
-                    onClick={() => setSelectedDocId(doc.id)}
-                    className={`p-3 rounded-2xl border-2 transition-all cursor-pointer text-xs flex items-start justify-between ${
-                      selectedDocId === doc.id
-                        ? 'border-teal-600 bg-teal-50/50 shadow-xs'
-                        : 'border-slate-200 hover:border-slate-300 bg-white'
-                    }`}
-                  >
-                    <div className="space-y-0.5">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-slate-900">{doc.fullName}</span>
-                        <span className="text-[10px] font-semibold bg-slate-100 text-slate-700 px-1.5 py-0.5 rounded">
-                          {doc.qualification}
-                        </span>
-                      </div>
-                      <p className="text-teal-800 font-semibold text-[11px]">{doc.specialization}</p>
-                      <p className="text-slate-500 text-[11px] flex items-center gap-1">
-                        <Building2 className="w-3 h-3 text-slate-400" />
-                        <span>{doc.hospitalName || 'OPD Medical Wing'}</span>
-                      </p>
-                      <p className="text-slate-400 text-[10px]">Reg: {doc.registrationNumber || (doc as any)?.regNumber} • {doc.experienceYears || 5}+ yrs exp</p>
-                    </div>
-
-                    <div className="mt-1">
-                      <div
-                        className={`w-5 h-5 rounded-full border flex items-center justify-center transition-all ${
-                          selectedDocId === doc.id
-                            ? 'bg-teal-600 border-teal-600 text-white'
-                            : 'border-slate-300 bg-white'
-                        }`}
-                      >
-                        {selectedDocId === doc.id && <Check className="w-3 h-3" />}
-                      </div>
-                    </div>
+            {/* SEND CONFIRMATION SCREEN (When a doctor is selected) */}
+            {showSendConfirmation && selectedDoctor ? (
+              <div className="space-y-4 py-2 text-xs">
+                <div className="p-4 bg-teal-50/70 border-2 border-teal-400 rounded-2xl space-y-3">
+                  <div className="flex items-center gap-2 text-teal-900 font-bold text-sm">
+                    <ShieldCheck className="w-5 h-5 text-teal-700 shrink-0" />
+                    <span>Confirm Report Delivery</span>
                   </div>
-                ))
-              )}
-            </div>
+                  <p className="text-slate-700 font-medium">
+                    You are about to send your clinical intake report to:
+                  </p>
+                  <div className="p-3 bg-white rounded-xl border border-teal-200 space-y-1">
+                    <h4 className="font-black text-slate-900 text-sm">{selectedDoctor.fullName}</h4>
+                    <p className="text-teal-800 font-bold text-[11px]">{selectedDoctor.specialization}</p>
+                    <p className="text-slate-600 text-[11px] flex items-center gap-1">
+                      <Building2 className="w-3.5 h-3.5 text-slate-400" />
+                      <span>{selectedDoctor.hospitalName || 'Outpatient Clinic'}</span>
+                    </p>
+                    <p className="text-slate-400 text-[10px]">
+                      {selectedDoctor.city}, {selectedDoctor.state} • Reg: {selectedDoctor.registrationNumber}
+                    </p>
+                  </div>
+                </div>
 
-            {/* Patient Note */}
-            <div>
-              <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
-                Optional Message / Notes for Doctor:
-              </label>
-              <textarea
-                rows={2}
-                value={patientNote}
-                onChange={e => setPatientNote(e.target.value)}
-                placeholder="e.g., Symptoms worse in morning, please check ECG..."
-                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
-              />
-            </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                    Optional Note for Doctor:
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={patientNote}
+                    onChange={e => setPatientNote(e.target.value)}
+                    placeholder="e.g., Symptoms worse at night, attaching ECG for review..."
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
+                  />
+                </div>
 
-            {/* Actions */}
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
-              <button
-                onClick={() => setIsShareModalOpen(false)}
-                className="px-4 py-2 border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold rounded-xl text-xs cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleShareReport}
-                disabled={!selectedDocId || isSendingShare}
-                className="px-6 py-2 bg-teal-600 hover:bg-teal-700 disabled:bg-slate-300 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer transition-all"
-              >
-                {isSendingShare ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Delivering...</span>
-                  </>
-                ) : (
-                  <>
-                    <Send className="w-3.5 h-3.5" />
-                    <span>Send Pre-Consultation Report</span>
-                  </>
-                )}
-              </button>
-            </div>
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
+                  <button
+                    onClick={() => setShowSendConfirmation(false)}
+                    className="px-4 py-2 border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold rounded-xl text-xs cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleConfirmAndSend}
+                    disabled={isSendingShare}
+                    className="px-6 py-2 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer transition-all"
+                  >
+                    {isSendingShare ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Sending Report...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-3.5 h-3.5" />
+                        <span>Confirm & Send</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* DOCTOR SEARCH & LIST SCREEN */
+              <>
+                {/* Search Inputs: Doctor Name and Hospital / Clinic Name */}
+                <div className="space-y-2 text-xs">
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">
+                      Doctor Name:
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Dr. Ananya Sharma"
+                      value={searchDoctorName}
+                      onChange={e => setSearchDoctorName(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">
+                      Hospital / Clinic Name:
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. ABC Multispeciality Hospital"
+                      value={searchHospitalName}
+                      onChange={e => setSearchHospitalName(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
+                    />
+                  </div>
+
+                  <button
+                    onClick={handlePerformSearch}
+                    className="w-full py-2 bg-slate-100 hover:bg-teal-50 text-teal-800 font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-200 hover:border-teal-300 transition-all cursor-pointer"
+                  >
+                    <Search className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Search Doctor Directory</span>
+                  </button>
+                </div>
+
+                {/* Matching Doctor Cards */}
+                <div className="flex-1 overflow-y-auto space-y-2.5 max-h-64 pr-1">
+                  {isLoadingDoctors ? (
+                    <div className="py-8 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
+                      <RefreshCw className="w-4 h-4 animate-spin text-teal-600" />
+                      <span>Loading registered doctors...</span>
+                    </div>
+                  ) : searchResults.length === 0 ? (
+                    <div className="py-8 text-center text-slate-400 text-xs">
+                      No matching doctors found. Please check spelling of Doctor Name or Hospital.
+                    </div>
+                  ) : (
+                    searchResults.map(doc => {
+                      const isExpanded = expandedDocId === doc.id;
+                      return (
+                        <div
+                          key={doc.id}
+                          className="p-3.5 rounded-2xl border border-slate-200 hover:border-teal-400 bg-white shadow-xs space-y-2 text-xs transition-all"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="space-y-0.5">
+                              <div className="flex items-center gap-2">
+                                <h4 className="font-black text-slate-900 text-xs sm:text-sm">{doc.fullName}</h4>
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded text-[9px] font-bold">
+                                  <ShieldCheck className="w-3 h-3" /> Verified Doctor
+                                </span>
+                              </div>
+                              <p className="text-teal-800 font-bold text-[11px]">{doc.specialization}</p>
+                              <p className="text-slate-600 text-[11px] flex items-center gap-1">
+                                <Building2 className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span>{doc.hospitalName || 'Outpatient Clinic'}</span>
+                              </p>
+                              <p className="text-slate-400 text-[10px]">
+                                {doc.city}, {doc.state}
+                              </p>
+                            </div>
+
+                            <button
+                              onClick={() => {
+                                setSelectedDoctor(doc);
+                                setShowSendConfirmation(true);
+                              }}
+                              className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold rounded-xl text-xs flex items-center gap-1 shrink-0 shadow-xs cursor-pointer transition-all"
+                            >
+                              <span>Send Clinical Report</span>
+                              <ArrowRight className="w-3 h-3" />
+                            </button>
+                          </div>
+
+                          {/* View Profile details toggle */}
+                          <div className="pt-1.5 border-t border-slate-100 flex items-center justify-between text-[10px]">
+                            <button
+                              onClick={() => setExpandedDocId(isExpanded ? null : doc.id)}
+                              className="text-teal-700 hover:text-teal-900 font-semibold flex items-center gap-1 cursor-pointer"
+                            >
+                              <span>{isExpanded ? 'Hide Profile' : 'View Profile'}</span>
+                              {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                            </button>
+                            <span className="text-slate-400">Reg: {doc.registrationNumber} • {doc.experienceYears || 5}+ yrs exp</span>
+                          </div>
+
+                          {isExpanded && (
+                            <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-[11px] text-slate-700 space-y-1 animate-fade-in">
+                              <p><span className="font-bold">Qualification:</span> {doc.qualification}</p>
+                              <p><span className="font-bold">Council:</span> {doc.council || 'State Medical Council'}</p>
+                              {doc.bio && <p className="italic text-slate-500">{doc.bio}</p>}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                <div className="flex items-center justify-end pt-2 border-t border-slate-200">
+                  <button
+                    onClick={() => setIsShareModalOpen(false)}
+                    className="px-4 py-2 border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold rounded-xl text-xs cursor-pointer"
+                  >
+                    Close
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

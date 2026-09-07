@@ -326,6 +326,7 @@ export interface RedFlagAlert {
   createdAt: string;
   status: 'UNREVIEWED' | 'ACKNOWLEDGED' | 'RESOLVED';
   symptomSummary: string;
+  actionRequired?: string;
 }
 
 export interface AISummary {

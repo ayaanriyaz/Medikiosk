@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Patient, Language, ClinicalInterview, InterviewMessage, ClinicalReport, Intake } from '../types';
+import { Patient, Language, ClinicalInterview, InterviewMessage, ClinicalReport, Intake, MedicalDocument } from '../types';
 import { translations } from '../i18n';
+import { ReportUploadModal } from './ReportUploadModal';
+import { isNonMedicalQuestion, NON_MEDICAL_REFUSAL_EN, NON_MEDICAL_REFUSAL_HI } from '../services/clinicalInterviewService';
 import {
   Mic,
   MicOff,
@@ -62,6 +64,7 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
   const [showLiveSummary, setShowLiveSummary] = useState(true);
   const [redFlagNotice, setRedFlagNotice] = useState<string | null>(null);
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -179,6 +182,40 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
     const text = (textToSend !== undefined ? textToSend : inputText).trim();
     if (!text || !interview || isSending) return;
 
+    // Strict non-medical refusal check (Anna is strictly a clinical intake assistant)
+    if (isNonMedicalQuestion(text)) {
+      const refusalText = language === 'hi' ? NON_MEDICAL_REFUSAL_HI : NON_MEDICAL_REFUSAL_EN;
+      const userMsg: InterviewMessage = {
+        id: `MSG-${Date.now()}-user`,
+        interviewId: interview.id,
+        sender: 'patient',
+        message: text,
+        timestamp: new Date().toISOString(),
+        language,
+        questionCategory: 'chief_complaint',
+      };
+      const botMsg: InterviewMessage = {
+        id: `MSG-${Date.now()}-refusal`,
+        interviewId: interview.id,
+        sender: 'bot',
+        message: refusalText,
+        timestamp: new Date().toISOString(),
+        language,
+        questionCategory: 'safety',
+        quickOptions: language === 'hi'
+          ? ['मुझे सीने में दर्द है', 'मुझे 3 दिन से बुखार है', 'दवाइयां जोड़ें']
+          : ['I have chest pain', 'I have fever since 3 days', 'Add medications'],
+      };
+      setInputText('');
+      setVoiceTranscript(null);
+      setInterview({
+        ...interview,
+        messages: [...interview.messages, userMsg, botMsg],
+      });
+      speakBotMessage(botMsg);
+      return;
+    }
+
     setIsSending(true);
     setInputText('');
     setVoiceTranscript(null);
@@ -232,20 +269,18 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
     handleSendMessage(language === 'hi' ? 'जानकारी उपलब्ध नहीं / ज्ञात नहीं' : 'Not reported / Not sure');
   };
 
-  // Handle Prescription / Medicine Strip Photo OCR
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file || !interview) return;
-
+  // Handle Document Confirmed from Modal
+  const handleDocumentConfirmed = async (doc: MedicalDocument) => {
+    if (!interview) return;
     setIsUploading(true);
     try {
       const res = await fetch(`/api/interviews/${interview.id}/upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          docName: file.name,
-          docType: file.type.includes('image') ? 'Prescription' : 'Prescription',
-          previewText: `Prescription issued for ${patient.name}. Meds: Telmisartan 40mg once daily, Metformin 500mg BD after food. BP: 142/88.`,
+          docName: doc.name,
+          docType: doc.type,
+          document: doc,
         }),
       });
 
@@ -261,37 +296,21 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
       console.error('Failed to upload document:', err);
     } finally {
       setIsUploading(false);
+      setIsUploadModalOpen(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
+  // Handle Prescription / Medicine Strip Photo OCR
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || !interview) return;
+    setIsUploadModalOpen(true);
+  };
+
   // Trigger simulated prescription photo capture
-  const handleSimulatePrescriptionSnap = async () => {
-    if (!interview) return;
-    setIsUploading(true);
-    try {
-      const res = await fetch(`/api/interviews/${interview.id}/upload`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          docName: 'Sample_Rx_Cardiology_AIIA.jpg',
-          docType: 'Prescription',
-          previewText: 'Rx: Tab Telmisartan 40mg OD, Tab Atorvastatin 20mg HS. No known penicillin allergy.',
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setInterview(data.interview);
-        const lastMsg = data.interview.messages[data.interview.messages.length - 1];
-        if (lastMsg) {
-          speakBotMessage(lastMsg);
-        }
-      }
-    } catch (err) {
-      console.error('Failed to simulate prescription OCR:', err);
-    } finally {
-      setIsUploading(false);
-    }
+  const handleSimulatePrescriptionSnap = () => {
+    setIsUploadModalOpen(true);
   };
 
   // Complete Interview and Generate Report
@@ -369,7 +388,7 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-base font-bold text-slate-900">
-                  {language === 'hi' ? 'एआई नैदानिक इंटेक सहायक' : 'AI Clinical Intake Assistant'}
+                  {language === 'hi' ? 'अन्ना — एआई नैदानिक इंटेक सहायक' : 'Anna — AI Clinical Intake Assistant'}
                 </h2>
                 <span className="text-[10px] font-bold uppercase tracking-wider bg-teal-100 text-teal-800 px-2 py-0.5 rounded-full">
                   OPD Triage
@@ -582,7 +601,7 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
           <div className="flex items-center gap-2">
             {/* Camera / Rx OCR Button */}
             <button
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => setIsUploadModalOpen(true)}
               title="Upload prescription or medicine strip photo"
               className="p-3 text-slate-600 hover:text-teal-700 bg-slate-100 hover:bg-teal-50 border border-slate-200 rounded-2xl transition-all cursor-pointer shrink-0"
             >
@@ -808,6 +827,16 @@ export const AIClinicalChatbot: React.FC<AIClinicalChatbotProps> = ({
           </p>
         </div>
       </div>
+
+      {/* Report & Prescription Upload / OCR Verification Modal */}
+      <ReportUploadModal
+        isOpen={isUploadModalOpen}
+        onClose={() => setIsUploadModalOpen(false)}
+        onSaveDocument={handleDocumentConfirmed}
+        patientName={patient.name}
+        patientId={patient.id}
+        language={language}
+      />
     </div>
   );
 };

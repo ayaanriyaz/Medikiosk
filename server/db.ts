@@ -489,7 +489,7 @@ export function getDemoDoctors(): (DoctorUser & { passwordHash: string })[] {
       gender: 'Female',
       dob: '1988-04-12',
       hospitalId: 'HOSP-202',
-      hospitalName: 'MediCare Hospital',
+      hospitalName: 'ABC Multispeciality Hospital',
       hospitalDepartment: 'Department of Internal Medicine',
       city: 'Kanpur',
       state: 'Uttar Pradesh',
